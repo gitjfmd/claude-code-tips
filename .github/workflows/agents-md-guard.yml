@@ -37,11 +37,20 @@ jobs:
       - name: extract the guard from the protected base
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          CENTRAL_COMMAND_READ_PAT: ${{ secrets.CENTRAL_COMMAND_READ_PAT }}
         run: |
           git -c credential.helper= \
             -c 'credential.helper=!f() { echo username=x-access-token; echo password="$GITHUB_TOKEN"; }; f' \
             fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
-          git show "origin/$BASE_REF:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
+          if git cat-file -e "origin/$BASE_REF:scripts/agents-md-guard.sh" 2>/dev/null; then
+            git show "origin/$BASE_REF:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
+          else
+            git -c credential.helper= \
+              -c 'credential.helper=!f() { echo username=x-access-token; echo password="$CENTRAL_COMMAND_READ_PAT"; }; f' \
+              fetch --no-tags https://github.com/gitjfmd/central-command.git \
+              "+refs/heads/dev:refs/remotes/central-command/dev"
+            git show "central-command/dev:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
+          fi
           chmod +x "$RUNNER_TEMP/agents-md-guard.sh"
 
       - name: selftest
