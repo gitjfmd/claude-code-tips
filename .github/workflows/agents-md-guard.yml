@@ -1,0 +1,39 @@
+name: agents-md-guard
+
+# AGENTS.md at the repo root is the only hand-edited agent rules file; QWEN.md,
+# WARP.md, .clinerules/00-central-command-rules.md, .github/copilot-instructions.md
+# (and GEMINI.md when present) are byte copies, and CLAUDE.md is the stub
+# "@AGENTS.md" unless .agents-md-guard-exceptions lists it. Only a branch named
+# agents-md-update-* may change any of them (CEO 2026-11-18). Logic and cases:
+# scripts/agents-md-guard.sh.
+#
+# The CEO decided (2026-11-18) this check is REQUIRED in branch protection, so there is
+# deliberately no `paths:` filter: a required check that a paths filter skips never
+# reports and blocks the PR.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  agents-md-guard:
+    name: agents-md-guard
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # branch-gate diffs <base>...HEAD, which needs the merge base
+
+      - name: selftest
+        run: bash scripts/agents-md-guard.sh selftest
+
+      - name: copies match AGENTS.md, CLAUDE.md is the stub or excepted
+        run: bash scripts/agents-md-guard.sh check --canary
+
+      - name: only agents-md-update-* may change agent files
+        env:
+          BASE_REF: ${{ github.base_ref }}   # through env, never interpolated into the shell
+        run: bash scripts/agents-md-guard.sh branch-gate "origin/$BASE_REF"
