@@ -79,10 +79,18 @@ check() {
 }
 
 branch_gate() {
-  local base="${1:-}" changed branch actor allowed authorized
+  local base="${1:-}" changed branch actor allowed authorized required actual
   local actors=()
   [ -n "$base" ] || { say "usage: branch-gate <base-ref>"; return 1; }
   to_root
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    for required in PR_HEAD_REPO PR_ACTOR ORIGIN_REPO BASE_SHA PR_HEAD_SHA; do
+      [ -n "${!required:-}" ] || { say "FAIL $required is unset in CI"; return 1; }
+    done
+    actual="$(git rev-parse HEAD)" || { say "FAIL could not resolve HEAD"; return 1; }
+    [ "$actual" = "$PR_HEAD_SHA" ] || { say "FAIL HEAD '$actual' does not equal PR_HEAD_SHA '$PR_HEAD_SHA'"; return 1; }
+    [ "$base" = "$BASE_SHA" ] || { say "FAIL branch-gate base '$base' does not equal BASE_SHA '$BASE_SHA'"; return 1; }
+  fi
   git rev-parse -q --verify "$base^{commit}" >/dev/null || { say "FAIL base ref '$base' not found"; return 1; }
   changed="$(git diff --name-only "$base...HEAD" -- AGENTS.md CLAUDE.md GEMINI.md "${COPIES[@]}" "${CONTROL_FILES[@]}")" \
     || { say "FAIL could not diff $base...HEAD"; return 1; }
@@ -116,19 +124,23 @@ branch_gate() {
 }
 
 selftest() {
-  local self t fails=0 f n=0
+  local self t fails=0 f n=0 required base_sha head_sha
   self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GITHUB_HEAD_REF GITHUB_ACTIONS
-  unset ORIGIN_REPO PR_HEAD_REPO PR_ACTOR AGENTS_MD_AUTHORIZED_ACTORS
+  unset ORIGIN_REPO PR_HEAD_REPO PR_ACTOR AGENTS_MD_AUTHORIZED_ACTORS BASE_SHA PR_HEAD_SHA
   t="$(mktemp -d)"; trap "rm -rf '$t' '$t-nogit'" EXIT
   cd "$t" && git init -q -b main . || return 1
   g() { git -c user.email=t@t -c user.name=t -c core.hooksPath=/dev/null "$@"; }
   run() { bash "$self" "$@" >/dev/null 2>&1; }
   run_ci() {
+    local base_sha head_sha
+    base_sha="$(g rev-parse main)"
+    head_sha="$(g rev-parse HEAD)"
     env GITHUB_ACTIONS=true ORIGIN_REPO=gitjfmd/central-command \
       PR_HEAD_REPO="${1:-gitjfmd/central-command}" PR_ACTOR="${2:-gitjfmd}" \
       GITHUB_HEAD_REF="${3:-agents-md-update-ci}" \
-      bash "$self" branch-gate main >/dev/null 2>&1
+      BASE_SHA="$base_sha" PR_HEAD_SHA="$head_sha" \
+      bash "$self" branch-gate "$base_sha" >/dev/null 2>&1
   }
   expect() {  # want label cmd...
     local want="$1" label="$2"; shift 2
@@ -171,6 +183,24 @@ selftest() {
   expect 1 "CI rejects fork head repo"         run_ci fork/central-command gitjfmd
   expect 1 "CI still requires the branch signal" run_ci gitjfmd/central-command gitjfmd feature/ci
   expect 0 "CI accepts authorized same-repo actor" run_ci
+  base_sha="$(g rev-parse main)"; head_sha="$(g rev-parse HEAD)"
+  for required in PR_HEAD_REPO PR_ACTOR ORIGIN_REPO BASE_SHA PR_HEAD_SHA; do
+    expect 1 "CI rejects unset $required" \
+      env GITHUB_ACTIONS=true ORIGIN_REPO=gitjfmd/central-command \
+      PR_HEAD_REPO=gitjfmd/central-command PR_ACTOR=gitjfmd \
+      GITHUB_HEAD_REF=agents-md-update-ci BASE_SHA="$base_sha" PR_HEAD_SHA="$head_sha" \
+      "$required=" bash "$self" branch-gate "$base_sha"
+  done
+  expect 1 "CI rejects event head mismatch" \
+    env GITHUB_ACTIONS=true ORIGIN_REPO=gitjfmd/central-command \
+    PR_HEAD_REPO=gitjfmd/central-command PR_ACTOR=gitjfmd \
+    GITHUB_HEAD_REF=agents-md-update-ci BASE_SHA="$base_sha" PR_HEAD_SHA="$base_sha" \
+    bash "$self" branch-gate "$base_sha"
+  expect 1 "CI rejects a mutable base ref" \
+    env GITHUB_ACTIONS=true ORIGIN_REPO=gitjfmd/central-command \
+    PR_HEAD_REPO=gitjfmd/central-command PR_ACTOR=gitjfmd \
+    GITHUB_HEAD_REF=agents-md-update-ci BASE_SHA="$base_sha" PR_HEAD_SHA="$head_sha" \
+    bash "$self" branch-gate main
   mkdir "$t-nogit" && cd "$t-nogit" && printf '# rules\n' > AGENTS.md  # outside any repo
   expect 0 "sync works before git init"       run sync
   expect 0 "check passes before git init"     run check

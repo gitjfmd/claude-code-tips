@@ -20,10 +20,13 @@ permissions:
 jobs:
   agents-md-guard:
     name: agents-md-guard
-    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Fail closed until this repository has its own ARC scale set. Never use GitHub-hosted runners.
+    runs-on: NONE-MEASURED
     timeout-minutes: 5
     env:
-      BASE_REF: ${{ github.base_ref }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       ORIGIN_REPO: ${{ github.repository }}
       PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       PR_ACTOR: ${{ github.event.pull_request.user.login }}
@@ -31,26 +34,32 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0   # branch-gate diffs <base>...HEAD, which needs the merge base
           persist-credentials: false
 
-      - name: extract the guard from the protected base
+      - name: verify the checked-out head matches the event
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$PR_HEAD_SHA" ]; then
+            echo "HEAD $actual does not match event head $PR_HEAD_SHA"
+            exit 1
+          fi
+
+      - name: extract the guard from the protected base commit
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          CENTRAL_COMMAND_READ_PAT: ${{ secrets.CENTRAL_COMMAND_READ_PAT }}
         run: |
-          git -c credential.helper= \
-            -c 'credential.helper=!f() { echo username=x-access-token; echo password="$GITHUB_TOKEN"; }; f' \
-            fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
-          if git cat-file -e "origin/$BASE_REF:scripts/agents-md-guard.sh" 2>/dev/null; then
-            git show "origin/$BASE_REF:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
-          else
-            git -c credential.helper= \
-              -c 'credential.helper=!f() { echo username=x-access-token; echo password="$CENTRAL_COMMAND_READ_PAT"; }; f' \
-              fetch --no-tags https://github.com/gitjfmd/central-command.git \
-              "+refs/heads/dev:refs/remotes/central-command/dev"
-            git show "central-command/dev:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: Bearer $GITHUB_TOKEN" \
+            git fetch --no-tags origin "$BASE_SHA"
+          if ! git cat-file -e "$BASE_SHA:scripts/agents-md-guard.sh" 2>/dev/null; then
+            echo "Protected base $BASE_SHA lacks scripts/agents-md-guard.sh"
+            echo "Merge the guard-only bootstrap PR from agents-md-update-bootstrap-guard before this PR"
+            exit 1
           fi
+          git show "$BASE_SHA:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
           chmod +x "$RUNNER_TEMP/agents-md-guard.sh"
 
       - name: selftest
@@ -60,4 +69,4 @@ jobs:
         run: '"$RUNNER_TEMP/agents-md-guard.sh" check --canary'
 
       - name: only agents-md-update-* with trusted provenance may change protected files
-        run: '"$RUNNER_TEMP/agents-md-guard.sh" branch-gate "origin/$BASE_REF"'
+        run: '"$RUNNER_TEMP/agents-md-guard.sh" branch-gate "$BASE_SHA"'
