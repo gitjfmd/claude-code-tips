@@ -2,7 +2,7 @@
 # agents-md-guard.sh: AGENTS.md at the repo root is the ONLY hand-edited agent rules
 # file. Every other agent file is derived from it (CEO decision 2026-11-18):
 #   QWEN.md, WARP.md, .clinerules/00-central-command-rules.md,
-#   .github/copilot-instructions.md, and GEMINI.md when present: byte copies.
+#   .github/copilot-instructions.md, GEMINI.md: byte copies.
 #   CLAUDE.md: the single line "@AGENTS.md", unless .agents-md-guard-exceptions lists it.
 # A copy that is a symlink resolving to AGENTS.md is left as it is and passes.
 # Only a branch named agents-md-update-* may change any of these files or the guard's
@@ -20,7 +20,7 @@
 # a directory that is not a git repo yet). Exit 0 = ok, 1 = fail.
 set -uo pipefail
 
-COPIES=(QWEN.md WARP.md .clinerules/00-central-command-rules.md .github/copilot-instructions.md)
+COPIES=(QWEN.md WARP.md .clinerules/00-central-command-rules.md .github/copilot-instructions.md GEMINI.md)
 STUB='@AGENTS.md'
 CANARY='CANARY-GUARDRAILS-V1'
 EXCEPTIONS=.agents-md-guard-exceptions
@@ -29,9 +29,24 @@ BRANCH_RE='^agents-md-update-'
 
 say() { echo "agents-md-guard: $*"; }
 
-copy_set() {  # the four copies, plus GEMINI.md when present
+copy_set() {  # the copies; sync writes all of them from AGENTS.md
   printf '%s\n' "${COPIES[@]}"
-  if [ -e GEMINI.md ] || [ -L GEMINI.md ]; then echo GEMINI.md; fi
+}
+# Agent-instruction paths: the known ones plus anything inside the known
+# categories (.clinerules/, .cursor/rules/, .windsurf/, *.mdc). Unknown members
+# of a category are protected too (fail closed); only plain project files pass.
+is_agent_path() {
+  case "$1" in
+    AGENTS.md|CLAUDE.md|GEMINI.md|QWEN.md|WARP.md|.github/copilot-instructions.md) return 0 ;;
+    .clinerules/*|.cursor/rules/*|.windsurf/*|.windsurfrules|*.mdc) return 0 ;;
+  esac
+  return 1
+}
+is_control_path() {
+  case "$1" in
+    scripts/agents-md-guard.sh|.agents-md-guard-exceptions|.pre-commit-config.yaml|.github/workflows/agents-md-guard.yml) return 0 ;;
+  esac
+  return 1
 }
 links_to_agents() { [ -L "$1" ] && [ "$1" -ef AGENTS.md ]; }
 claude_excepted() { grep -qE '^CLAUDE\.md([[:space:]]|$)' "$EXCEPTIONS" 2>/dev/null; }
@@ -79,7 +94,7 @@ check() {
 }
 
 branch_gate() {
-  local base="${1:-}" changed branch actor allowed authorized required actual
+  local base="${1:-}" changed protected f branch actor allowed authorized required actual
   local actors=()
   [ -n "$base" ] || { say "usage: branch-gate <base-ref>"; return 1; }
   to_root
@@ -92,13 +107,23 @@ branch_gate() {
     [ "$base" = "$BASE_SHA" ] || { say "FAIL branch-gate base '$base' does not equal BASE_SHA '$BASE_SHA'"; return 1; }
   fi
   git rev-parse -q --verify "$base^{commit}" >/dev/null || { say "FAIL base ref '$base' not found"; return 1; }
-  changed="$(git diff --name-only "$base...HEAD" -- AGENTS.md CLAUDE.md GEMINI.md "${COPIES[@]}" "${CONTROL_FILES[@]}")" \
+  # ALL changed files, no restrictive pathspec: a path outside a known list must
+  # not slip past the gate, so classification happens after the diff.
+  changed="$(git diff --name-only "$base...HEAD")" \
     || { say "FAIL could not diff $base...HEAD"; return 1; }
-  [ -z "$changed" ] && { say "branch-gate OK (no agent or control file changed vs $base)"; return 0; }
+  [ -z "$changed" ] && { say "branch-gate OK (no files changed vs $base)"; return 0; }
+  protected=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if is_agent_path "$f" || is_control_path "$f"; then
+      protected="${protected}${f}"$'\n'
+    fi
+  done <<< "$changed"
+  [ -z "$protected" ] && { say "branch-gate OK (no agent or control file changed vs $base)"; return 0; }
   branch="${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}"
   if ! [[ "$branch" =~ $BRANCH_RE ]]; then
     say "FAIL branch '$branch' changes agent or control files; only a branch named agents-md-update-* may:"
-    printf '  %s\n' $changed
+    printf '  %s\n' $protected
     return 1
   fi
   if [ "${GITHUB_ACTIONS:-}" = true ]; then
@@ -108,12 +133,19 @@ branch_gate() {
     fi
     actor="${PR_ACTOR:-}"
     authorized=false
-    IFS=',' read -r -a actors <<< "${AGENTS_MD_AUTHORIZED_ACTORS:-gitjfmd}"
-    for allowed in "${actors[@]}"; do
-      [ "$actor" = "$allowed" ] && { authorized=true; break; }
-    done
+    # AGENTS_MD_AUTHORIZED_ACTORS is MANDATORY with no default: unset or empty
+    # denies every actor. Entries are comma-separated, trimmed, empties skipped.
+    if [ -n "${AGENTS_MD_AUTHORIZED_ACTORS:-}" ]; then
+      IFS=',' read -r -a actors <<< "$AGENTS_MD_AUTHORIZED_ACTORS"
+      for allowed in "${actors[@]}"; do
+        allowed="${allowed#"${allowed%%[![:space:]]*}"}"
+        allowed="${allowed%"${allowed##*[![:space:]]}"}"
+        [ -n "$allowed" ] || continue
+        [ "$actor" = "$allowed" ] && { authorized=true; break; }
+      done
+    fi
     if [ "$authorized" != true ]; then
-      say "FAIL PR actor '$actor' is not in AGENTS_MD_AUTHORIZED_ACTORS"
+      say "FAIL PR actor '$actor' is not in AGENTS_MD_AUTHORIZED_ACTORS (unset or empty denies all actors)"
       return 1
     fi
     say "branch-gate OK ($branch, same-repo PR, authorized actor $actor)"
@@ -139,6 +171,7 @@ selftest() {
     env GITHUB_ACTIONS=true ORIGIN_REPO=gitjfmd/central-command \
       PR_HEAD_REPO="${1:-gitjfmd/central-command}" PR_ACTOR="${2:-gitjfmd}" \
       GITHUB_HEAD_REF="${3:-agents-md-update-ci}" \
+      AGENTS_MD_AUTHORIZED_ACTORS="${4-gitjfmd}" \
       BASE_SHA="$base_sha" PR_HEAD_SHA="$head_sha" \
       bash "$self" branch-gate "$base_sha" >/dev/null 2>&1
   }
@@ -165,6 +198,10 @@ selftest() {
   expect 0 "symlink to AGENTS.md passes"      run check
   printf '# rules\n' > AGENTS.md; run sync
   expect 1 "--canary fails without the canary" run check --canary
+  printf '# rules\n%s\n' "$CANARY" > AGENTS.md; run sync
+  rm GEMINI.md
+  expect 1 "missing GEMINI.md fails"               run check
+  run sync
   for f in "${CONTROL_FILES[@]}"; do mkdir -p "$(dirname "$f")"; : >> "$f"; done
   g add -A && g commit -qm base
   g checkout -q -b agents-md-update-x && printf 'more\n' >> AGENTS.md && run sync && g commit -qam x
@@ -183,6 +220,19 @@ selftest() {
   expect 1 "CI rejects fork head repo"         run_ci fork/central-command gitjfmd
   expect 1 "CI still requires the branch signal" run_ci gitjfmd/central-command gitjfmd feature/ci
   expect 0 "CI accepts authorized same-repo actor" run_ci
+  expect 1 "CI rejects empty AGENTS_MD_AUTHORIZED_ACTORS (deny all)" \
+    run_ci gitjfmd/central-command gitjfmd agents-md-update-ci ""
+  expect 0 "CI trims and skips empty actor entries" \
+    run_ci gitjfmd/central-command gitjfmd agents-md-update-ci " , gitjfmd , mallory "
+  g checkout -q -b feature/unknown-agent main
+  mkdir -p .cursor/rules && printf 'rule\n' > .cursor/rules/x.mdc && printf 'rule\n' > .clinerules/zzz.md && printf 'note\n' > notes.mdc
+  g add -A && g commit -qm unknown
+  expect 1 "gate fails for unknown agent-instruction paths on feature/unknown-agent" run branch-gate main
+  g checkout -q -b agents-md-update-unknown main
+  g merge -q --no-edit feature/unknown-agent 2>/dev/null || g cherry-pick -q feature/unknown-agent 2>/dev/null
+  printf 'agent\n' >> AGENTS.md && run sync
+  g add -A && g commit -qm unknown-ok
+  expect 0 "gate passes for unknown agent-instruction paths on agents-md-update-*" run branch-gate main
   base_sha="$(g rev-parse main)"; head_sha="$(g rev-parse HEAD)"
   for required in PR_HEAD_REPO PR_ACTOR ORIGIN_REPO BASE_SHA PR_HEAD_SHA; do
     expect 1 "CI rejects unset $required" \
