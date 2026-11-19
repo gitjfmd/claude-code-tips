@@ -1,0 +1,78 @@
+name: central-policy-sync
+
+# central-policy-sync (CEO 2026-11-19): each repo root carries
+# central-command/policies-procedures/ = the pull of central-command DEV's
+# policies-procedures folder (policy DATA, not an agent file). This hourly job
+# refreshes it and commits ONLY when content differs. It NEVER runs on
+# pull_request and never checks out untrusted code before using the PAT.
+# CENTRAL_COMMAND_READ_PAT is a READ-ONLY PAT for gitjfmd/central-command; it is
+# named here and never echoed. Canonical doc:
+# policies-procedures/operations/procedures/CENTRAL-POLICY-SYNC.md
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly at :17 UTC, off the :00/:30 marks
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: central-policy-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: central-policy-sync
+    # Literal local ARC label (this repo's CI_RUNNER value). No vars fallback and
+    # no hosted runner: a silent ubuntu-latest fallback is how the PAT leaves the
+    # fleet.
+    runs-on: NONE-MEASURED
+    steps:
+      - name: Check out this repo's default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pull central-command policies-procedures at an immutable dev SHA
+        id: pull
+        env:
+          CENTRAL_COMMAND_READ_PAT: ${{ secrets.CENTRAL_COMMAND_READ_PAT }}
+        run: |
+          set -euo pipefail
+          test -n "${CENTRAL_COMMAND_READ_PAT:-}" || { echo "CENTRAL_COMMAND_READ_PAT secret is not set"; exit 1; }
+          # PAT travels in an auth header, never in the remote URL: git prints
+          # the URL on failure and would print the token with it.
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CENTRAL_COMMAND_READ_PAT" | base64 | tr -d '\n')"
+          SRC="https://github.com/gitjfmd/central-command.git"
+          # Immutable-SHA rule: resolve dev first, then fetch THAT sha, so a
+          # mid-pull ref move cannot produce a torn tree.
+          SHA="$(git -c http.extraheader="$AUTH" ls-remote "$SRC" refs/heads/dev | cut -f1)"
+          test -n "$SHA" || { echo "could not resolve central-command dev"; exit 1; }
+          git -c http.extraheader="$AUTH" fetch --no-tags "$SRC" "$SHA"
+          rm -rf central-command/policies-procedures
+          mkdir -p central-command
+          git archive FETCH_HEAD policies-procedures | tar -x -C central-command
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "pulled central-command dev $SHA into central-command/policies-procedures/"
+
+      - name: Commit and push only when content differs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.pull.outputs.sha }}
+          DEF_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git add -A central-command/policies-procedures
+          if git diff --cached --quiet; then
+            echo "central-command/policies-procedures is current; no commit"
+            exit 0
+          fi
+          BODY="provenance_record:"$'\n'"  recorded_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"$'\n'"  cli: github-actions"$'\n'"  workflow: central-policy-sync (run ${GITHUB_RUN_ID})"$'\n'"  source: gitjfmd/central-command dev @ ${SHA}"$'\n'"  target: central-command/policies-procedures"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore(policy-sync): central-command policies-procedures ${SHA}" -m "$BODY"
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          git -c http.extraheader="$AUTH" push "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${DEF_BRANCH}"
+          echo "committed central-command/policies-procedures ${SHA} to ${DEF_BRANCH}"
