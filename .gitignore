@@ -1,2 +1,5 @@
 .DS_Store
 node_modules/
+
+# per-project MCP scope key (Vault-rendered, never commit)
+.opencode/litellm-mcp.key

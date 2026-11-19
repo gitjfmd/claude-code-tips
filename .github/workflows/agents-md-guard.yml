@@ -1,0 +1,87 @@
+name: agents-md-guard
+
+# AGENTS.md at the repo root is the only hand-edited agent rules file; QWEN.md,
+# WARP.md, .clinerules/00-central-command-rules.md, .github/copilot-instructions.md
+# and GEMINI.md are byte copies, and CLAUDE.md is the stub
+# "@AGENTS.md" unless .agents-md-guard-exceptions lists it. Only a branch named
+# agents-md-update-* may change them or the guard's own control files (CEO 2026-11-18).
+# Logic and cases: scripts/agents-md-guard.sh, executed from the protected base ref.
+#
+# The CEO decided (2026-11-18) this check is REQUIRED in branch protection, so there is
+# deliberately no `paths:` filter: a required check that a paths filter skips never
+# reports and blocks the PR. The job is never skipped either: a fork PR fails closed
+# in a step BEFORE actions/checkout, so no untrusted code runs on a local runner.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  agents-md-guard:
+    name: agents-md-guard
+    # Fail closed until this repository has its own ARC scale set (K8-main-boss#2445;
+    # target label claude-code-tips). Never GitHub-hosted, never a shared fallback.
+    runs-on: NONE-MEASURED
+    timeout-minutes: 5
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      ORIGIN_REPO: ${{ github.repository }}
+      PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      PR_ACTOR: ${{ github.actor }}
+      AGENTS_MD_AUTHORIZED_ACTORS: ${{ vars.AGENTS_MD_AUTHORIZED_ACTORS }}
+    steps:
+      - name: fork PRs fail closed before checkout
+        run: |
+          if [ "$PR_HEAD_REPO" != "$ORIGIN_REPO" ]; then
+            echo "::error::PR head repo $PR_HEAD_REPO is not $ORIGIN_REPO; refusing to check out untrusted code on a local runner"
+            exit 1
+          fi
+
+      - name: require the actor allowlist
+        run: |
+          if [ -z "$AGENTS_MD_AUTHORIZED_ACTORS" ]; then
+            echo "::error::AGENTS_MD_AUTHORIZED_ACTORS must be configured with the allowed PR actors (unset or empty denies all)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0   # branch-gate diffs <base>...HEAD, which needs the merge base
+          persist-credentials: false
+
+      - name: verify the checked-out head matches the event
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$PR_HEAD_SHA" ]; then
+            echo "HEAD $actual does not match event head $PR_HEAD_SHA"
+            exit 1
+          fi
+
+      - name: extract the guard from the protected base commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: Bearer $GITHUB_TOKEN" \
+            git fetch --no-tags origin "$BASE_SHA"
+          if ! git cat-file -e "$BASE_SHA:scripts/agents-md-guard.sh" 2>/dev/null; then
+            echo "Protected base $BASE_SHA lacks scripts/agents-md-guard.sh"
+            echo "Merge the guard-only bootstrap PR from agents-md-update-bootstrap-guard before this PR"
+            exit 1
+          fi
+          git show "$BASE_SHA:scripts/agents-md-guard.sh" > "$RUNNER_TEMP/agents-md-guard.sh"
+          chmod +x "$RUNNER_TEMP/agents-md-guard.sh"
+
+      - name: selftest
+        run: '"$RUNNER_TEMP/agents-md-guard.sh" selftest'
+
+      - name: copies match AGENTS.md, CLAUDE.md is the stub or excepted
+        run: '"$RUNNER_TEMP/agents-md-guard.sh" check --canary'
+
+      - name: only agents-md-update-* with trusted provenance may change protected files
+        run: '"$RUNNER_TEMP/agents-md-guard.sh" branch-gate "$BASE_SHA"'
